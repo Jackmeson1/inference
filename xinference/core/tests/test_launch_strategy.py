@@ -98,6 +98,7 @@ class DummySupervisor(ModelReloadMixin):
         from xinference.core.supervisor import SupervisorActor
 
         self._worker_address_to_worker = workers
+        self._worker_metadata_generation = {}
         self._model_uid_to_replica_info = {}
         self._model_reload_tasks = {}
         self._replica_model_uid_to_worker = {}

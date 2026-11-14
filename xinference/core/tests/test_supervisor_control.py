@@ -64,6 +64,12 @@ class _LaunchWorker:
     async def get_model_count(self, **kwargs):
         return len(self.models)
 
+    async def list_models(self, **kwargs):
+        return {uid: {} for uid in self.models if not uid.endswith("-rank0")}
+
+    async def get_model_launch_status(self, model_uid, **kwargs):
+        return "READY" if model_uid in self.models else None
+
     async def get_gpu_allocation_status(self, **kwargs):
         return {
             "total": [0],
@@ -506,6 +512,268 @@ async def test_failed_initial_launch_recovery_ownership(
     assert all(w.models for w in rt.workers)
     assert rt.guard.get_instance_info(model_uid="failed")[0].status == "READY"
     await rt.owner.terminate_model("failed")
+    assert all(not w.models for w in rt.workers)
+
+
+@pytest.mark.asyncio
+async def test_failed_initial_launch_retired_worker(failed_launch_runtime):
+    rt = failed_launch_runtime
+    operation = await _failed_launch(rt)
+    rt.state.failed, rt.loss = False, "healthy"
+    retired = rt.workers[1]
+    await rt.owner.remove_worker(retired.address)
+    assert retired.address not in rt.owner._worker_address_to_worker
+    # Permanent shutdown has removed the models as well as the registration.
+    retired.models.clear()
+    retired.cleanup_error = ConnectionRefusedError("retired worker")
+    assert rt.owner._initial_model_launches["failed"] is operation
+
+    await rt.owner.terminate_model("failed")
+    assert all(not w.models for w in rt.workers)
+    assert not rt.owner._initial_model_launches
+    assert not rt.guard.get_instance_info(model_uid="failed")
+    rt.kwargs.update(replica=1, worker_ip=rt.workers[0].address)
+    rt.replacing = True
+    assert await rt.owner.launch_builtin_model(**rt.kwargs) == "failed"
+    assert rt.workers[0].models == {"failed-rep0"}
+    assert not retired.models
+    await rt.owner.terminate_model("failed")
+    assert all(not w.models for w in rt.workers)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "inventory_error", [ConnectionRefusedError, asyncio.TimeoutError]
+)
+async def test_failed_initial_launch_registered_worker_inventory(
+    failed_launch_runtime, monkeypatch, inventory_error
+):
+    rt = failed_launch_runtime
+    operation = await _failed_launch(rt)
+    rt.state.failed, rt.loss = False, "healthy"
+    worker = rt.workers[1]
+    worker.cleanup_error = ConnectionRefusedError("registered worker")
+    inventory = AsyncMock(side_effect=inventory_error("inventory unavailable"))
+    monkeypatch.setattr(worker, "list_models", inventory)
+    for unavailable in (True, False):
+        if not unavailable:
+            inventory.side_effect = None
+            inventory.return_value = {"failed-rep1": {}}
+        with pytest.raises(ConnectionRefusedError) as exc:
+            await rt.owner.terminate_model("failed", suppress_exception=True)
+        assert exc.value is worker.cleanup_error
+        assert worker.address in rt.owner._worker_address_to_worker
+        assert rt.owner._initial_model_launches["failed"] is operation
+        assert operation.workers["failed-rep1"] and worker.models
+        assert not operation.workers["failed-rep0"] and not rt.workers[0].models
+
+    # Failed re-registration removes the registry entry without proving death.
+    resources = worker.get_extension_resources
+    monkeypatch.setattr(
+        worker,
+        "get_extension_resources",
+        AsyncMock(side_effect=RuntimeError("registration failed")),
+    )
+    with pytest.raises(RuntimeError, match="registration failed"):
+        await rt.owner.add_worker(worker.address)
+    assert worker.address not in rt.owner._worker_address_to_worker
+    with pytest.raises(ConnectionRefusedError) as exc:
+        await rt.owner.terminate_model("failed")
+    assert exc.value is worker.cleanup_error
+    assert rt.owner._initial_model_launches["failed"] is operation
+    assert operation.workers["failed-rep1"] and worker.models
+    monkeypatch.setattr(worker, "get_extension_resources", resources)
+    await rt.owner.add_worker(worker.address)
+
+    # Only a fresh successful inventory for this registration proves absence.
+    worker.models.clear()
+    inventory.return_value = {}
+    await rt.owner.terminate_model("failed")
+    assert not rt.owner._initial_model_launches
+    assert all(not w.models for w in rt.workers)
+    assert not rt.guard.get_instance_info(model_uid="failed")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_write", ["first", "final", "all"])
+async def test_failed_initial_launch_status_write_failure(
+    failed_launch_runtime, failed_write
+):
+    rt = failed_launch_runtime
+    rt.loss = "healthy"
+    error_writes = 0
+
+    def update(uid, info):
+        nonlocal error_writes
+        if info.get("status") == "ERROR":
+            error_writes += 1
+            if (
+                failed_write == "all"
+                or (failed_write == "first" and error_writes == 1)
+                or (failed_write == "final" and error_writes == 2)
+            ):
+                raise RuntimeError("status write failed")
+        return rt.guard.update_instance_info(uid, info)
+
+    rt.owner._status_guard_ref.update_instance_info.side_effect = update
+    # The helper asserts identity of the propagated original launch exception.
+    await _failed_launch(rt)
+    assert error_writes >= (2 if failed_write == "final" else 1)
+    assert all(not w.models for w in rt.workers)
+    assert not rt.owner._initial_model_launches
+    assert not rt.owner._model_uid_to_replica_info
+    assert not rt.owner._replica_model_uid_to_worker
+
+
+@pytest.mark.asyncio
+async def test_failed_initial_launch_status_failure_preserves_cleanup_error(
+    failed_launch_runtime,
+):
+    rt = failed_launch_runtime
+    operation = await _failed_launch(rt)
+    rt.state.failed, rt.loss = False, "healthy"
+    worker = rt.workers[1]
+    worker.cleanup_error = RuntimeError("worker cleanup failed")
+    update = rt.owner._status_guard_ref.update_instance_info
+    update.side_effect = RuntimeError("status write failed")
+    with pytest.raises(RuntimeError) as exc:
+        await rt.owner.terminate_model("failed")
+    assert exc.value is worker.cleanup_error
+    assert rt.owner._initial_model_launches["failed"] is operation
+    assert operation.workers["failed-rep1"] and worker.models
+    update.side_effect = rt.guard.update_instance_info
+    worker.cleanup_error = None
+    await rt.owner.terminate_model("failed")
+    assert all(not w.models for w in rt.workers)
+    assert not rt.owner._initial_model_launches
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hidden", ["launching", "rank0"])
+async def test_failed_initial_launch_catalog_absence_is_not_cleanup(
+    failed_launch_runtime, monkeypatch, hidden
+):
+    rt = failed_launch_runtime
+    if hidden == "rank0":
+        rt.kwargs.update(model_engine="vLLM", enable_xavier=True)
+    operation = await _failed_launch(rt)
+    rt.state.failed, rt.loss = False, "healthy"
+    worker = rt.workers[0 if hidden == "rank0" else 1]
+    uid = "failed-rank0" if hidden == "rank0" else "failed-rep1"
+    assert uid in worker.models
+    error = RuntimeError("cleanup unresolved")
+    terminate = worker.terminate_model
+
+    async def stop(model_uid, **kwargs):
+        if model_uid == uid:
+            raise error
+        await terminate(model_uid, **kwargs)
+
+    # Use the production catalog and launch-status semantics for hidden targets.
+    inventory = SimpleNamespace(
+        _model_uid_to_model_spec={},
+        _model_uid_to_model={uid: object()} if hidden == "rank0" else {},
+        _model_uid_launching_guard={uid: object()} if hidden == "launching" else {},
+    )
+
+    async def list_models(**kwargs):
+        return await WorkerActor.list_models(inventory)
+
+    async def launch_status(model_uid, **kwargs):
+        return WorkerActor.get_model_launch_status(inventory, model_uid)
+
+    monkeypatch.setattr(worker, "terminate_model", stop)
+    monkeypatch.setattr(worker, "list_models", list_models)
+    monkeypatch.setattr(worker, "get_model_launch_status", launch_status)
+    with pytest.raises(RuntimeError) as exc:
+        await rt.owner.terminate_model("failed")
+    assert exc.value is error
+    assert rt.owner._initial_model_launches["failed"] is operation
+    assert operation.workers[uid] and uid in worker.models
+    if hidden == "rank0":
+        assert rt.actors
+
+    worker.models.discard(uid)
+    inventory._model_uid_to_model.clear()
+    inventory._model_uid_launching_guard.clear()
+    await rt.owner.terminate_model("failed")
+    assert not rt.owner._initial_model_launches
+    assert not rt.actors and all(not w.models for w in rt.workers)
+
+
+@pytest.mark.asyncio
+async def test_failed_initial_launch_stale_inventory(
+    failed_launch_runtime, monkeypatch
+):
+    rt = failed_launch_runtime
+    operation = await _failed_launch(rt)
+    rt.state.failed, rt.loss = False, "healthy"
+    worker = rt.workers[1]
+    worker.cleanup_error = ConnectionRefusedError("cleanup unresolved")
+    worker.models.clear()
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def inventory(**kwargs):
+        entered.set()
+        await release.wait()
+        return {}
+
+    monkeypatch.setattr(worker, "list_models", inventory)
+    cleanup = asyncio.create_task(rt.owner.terminate_model("failed"))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        await rt.owner.add_worker(worker.address)
+    finally:
+        release.set()
+    with pytest.raises(ConnectionRefusedError) as exc:
+        await cleanup
+    assert exc.value is worker.cleanup_error
+    assert rt.owner._initial_model_launches["failed"] is operation
+    assert operation.workers["failed-rep1"]
+    worker.cleanup_error = None
+    await rt.owner.terminate_model("failed")
+    assert not rt.owner._initial_model_launches
+    assert all(not w.models for w in rt.workers)
+
+
+@pytest.mark.asyncio
+async def test_failed_initial_launch_stale_retirement(
+    failed_launch_runtime, monkeypatch
+):
+    rt = failed_launch_runtime
+    operation = await _failed_launch(rt)
+    rt.state.failed, rt.loss = False, "healthy"
+    worker = rt.workers[1]
+    registered = rt.owner._worker_address_to_worker[worker.address]
+    generation = rt.owner._worker_metadata_generation[worker.address]
+    entered, release = asyncio.Event(), asyncio.Event()
+    resources = worker.get_extension_resources
+
+    async def register(**kwargs):
+        entered.set()
+        await release.wait()
+        return await resources(**kwargs)
+
+    monkeypatch.setattr(worker, "get_extension_resources", register)
+    registration = asyncio.create_task(rt.owner.add_worker(worker.address))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        removal = asyncio.create_task(
+            rt.owner._remove_dead_worker(worker.address, registered)
+        )
+        await asyncio.sleep(0)
+        assert not removal.done()
+    finally:
+        release.set()
+    await registration
+    assert rt.owner._worker_address_to_worker[worker.address] is registered
+    assert rt.owner._worker_metadata_generation[worker.address] != generation
+    assert await removal is False
+    assert rt.owner._worker_address_to_worker[worker.address] is registered
+    assert rt.owner._initial_model_launches["failed"] is operation
+    assert operation.workers["failed-rep1"] and worker.models
+    await rt.owner.terminate_model("failed")
+    assert not rt.owner._initial_model_launches
     assert all(not w.models for w in rt.workers)
 
 

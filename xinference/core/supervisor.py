@@ -527,6 +527,11 @@ class SupervisorActor(ModelReloadMixin, SupervisorHandoffMixin, xo.StatelessActo
             await self._status_guard_ref.update_instance_info(
                 model_uid, {"status": LaunchStatus.ERROR.name}
             )
+        except (Exception, asyncio.CancelledError):
+            logger.warning(
+                "Failed to report launch error for %s", model_uid, exc_info=True
+            )
+        try:
             await self.terminate_model(model_uid, suppress_exception=True)
         except (Exception, asyncio.CancelledError):
             # Rollback must not replace the original launch exception.
@@ -559,9 +564,44 @@ class SupervisorActor(ModelReloadMixin, SupervisorHandoffMixin, xo.StatelessActo
         self, model_uid: str, operation: InitialModelLaunch
     ) -> None:
         async def stop(uid: str, worker: xo.ActorRefType["WorkerActor"]) -> None:
-            await worker.terminate_model(model_uid=uid)
-            # A rejected, cancelled or uncertain RPC still owns its target.
-            operation.workers[uid].remove(worker)
+            targets = operation.workers[uid]
+            if worker not in targets:
+                return
+            address = worker.address
+            registered = self._worker_address_to_worker.get(address)
+            generation = self._worker_metadata_generation.get(address)
+            try:
+                await worker.terminate_model(model_uid=uid)
+            except Exception as error:
+                # The removal path may have resolved this registration while
+                # termination was pending. An RPC error alone is not evidence.
+                if worker not in targets:
+                    return
+                if registered is None or registered != worker:
+                    raise
+                try:
+                    inventory = await worker.list_models()
+                    # The catalog omits rank zero and in-progress launches.
+                    launch_status = await worker.get_model_launch_status(uid)
+                except Exception:
+                    if worker not in targets:
+                        return
+                    raise error from None
+                if worker not in targets:
+                    return
+                # Use a fresh inventory from the retained reference, with no
+                # re-registration while either RPC was pending.
+                if (
+                    not isinstance(inventory, dict)
+                    or uid in inventory
+                    or launch_status is not None
+                    or self._worker_address_to_worker.get(address) is not registered
+                    or self._worker_metadata_generation.get(address) != generation
+                ):
+                    raise
+            # Only acknowledged cleanup or confirmed absence resolves a target.
+            if worker in targets:
+                targets.remove(worker)
 
         try:
             results = await asyncio.gather(
@@ -629,9 +669,14 @@ class SupervisorActor(ModelReloadMixin, SupervisorHandoffMixin, xo.StatelessActo
         finally:
             # Worker callbacks can report TERMINATING during a failed rollback.
             if self._initial_model_launches.get(model_uid) is operation:
-                await self._status_guard_ref.update_instance_info(
-                    model_uid, {"status": LaunchStatus.ERROR.name}
-                )
+                try:
+                    await self._status_guard_ref.update_instance_info(
+                        model_uid, {"status": LaunchStatus.ERROR.name}
+                    )
+                except (Exception, asyncio.CancelledError):
+                    logger.warning(
+                        "Failed to report launch error for %s", model_uid, exc_info=True
+                    )
         operation.cleanup_pending = False
         self._initial_model_launches.pop(model_uid)
 
@@ -876,6 +921,7 @@ class SupervisorActor(ModelReloadMixin, SupervisorHandoffMixin, xo.StatelessActo
            *all* its replicas are gone.
         3. Reconcile replica statuses/counts, and advance fully-gone models to
            TERMINATED so model_status disappears; degraded models stay READY.
+        4. Resolve failed-initial-launch targets for this retired registration.
         """
         affected_replica_uids = await self._record_unexpected_down_replicas(
             worker_address
@@ -896,6 +942,13 @@ class SupervisorActor(ModelReloadMixin, SupervisorHandoffMixin, xo.StatelessActo
             ):
                 await self._cleanup_distributed_actors(base_uid)
         await self._reconcile_affected_model_statuses(base_uids_affected)
+        # Only the confirmed removal paths call this helper. A rejected
+        # re-registration can also clear the registry, but is not proof of death.
+        worker_ref = self._worker_address_to_worker.get(worker_address)
+        for operation in getattr(self, "_initial_model_launches", {}).values():
+            if operation.cleanup_pending and not operation.cancelling:
+                for workers in operation.workers.values():
+                    workers[:] = [worker for worker in workers if worker != worker_ref]
         return affected_replica_uids
 
     def _clear_unexpected_down_replicas(self, model_uid: str) -> None:
@@ -5589,9 +5642,11 @@ class SupervisorActor(ModelReloadMixin, SupervisorHandoffMixin, xo.StatelessActo
             try:
                 dead_nodes = []
                 dead_worker_refs = {}
+                dead_worker_generations = {}
                 for address, status in self._worker_status.items():
                     if self._ownership_registry().protected(address):
                         continue
+                    generation = self._worker_metadata_generation.get(address)
                     if (
                         time.time() - status.update_time
                         > XINFERENCE_HEALTH_CHECK_TIMEOUT
@@ -5623,6 +5678,7 @@ class SupervisorActor(ModelReloadMixin, SupervisorHandoffMixin, xo.StatelessActo
                         dead_worker_refs[address] = self._worker_address_to_worker.get(
                             address
                         )
+                        dead_worker_generations[address] = generation
                     elif (
                         status.failure_remaining_count
                         != XINFERENCE_HEALTH_CHECK_FAILURE_THRESHOLD
@@ -5639,7 +5695,9 @@ class SupervisorActor(ModelReloadMixin, SupervisorHandoffMixin, xo.StatelessActo
                     # mapping cleanup (preserves healthy replicas of multi-replica
                     # models on surviving workers) + TERMINATED for fully-gone models.
                     if await self._remove_dead_worker(
-                        address, dead_worker_refs[address]
+                        address,
+                        dead_worker_refs[address],
+                        dead_worker_generations[address],
                     ):
                         removed_nodes.append(address)
                 dead_nodes = removed_nodes
@@ -5656,6 +5714,7 @@ class SupervisorActor(ModelReloadMixin, SupervisorHandoffMixin, xo.StatelessActo
                     if address in dead_nodes:
                         self._reverse_ping_failures.pop(address, None)
                         continue
+                    generation = self._worker_metadata_generation.get(address)
                     try:
                         await xo.wait_for(worker_ref.ping(), timeout=5)
                         # Reset on success
@@ -5664,6 +5723,8 @@ class SupervisorActor(ModelReloadMixin, SupervisorHandoffMixin, xo.StatelessActo
                         if (
                             self._ownership_registry().protected(address)
                             or self._worker_address_to_worker.get(address) != worker_ref
+                            or self._worker_metadata_generation.get(address)
+                            != generation
                         ):
                             continue
                         # If the worker is launching a model, exempt it from
@@ -5722,7 +5783,9 @@ class SupervisorActor(ModelReloadMixin, SupervisorHandoffMixin, xo.StatelessActo
                             # fully-gone models. Iterating a copied list above,
                             # so full worker removal here is safe and keeps
                             # _worker_status consistent with workers_total.
-                            if await self._remove_dead_worker(address, worker_ref):
+                            if await self._remove_dead_worker(
+                                address, worker_ref, generation
+                            ):
                                 self._schedule_autostart()
                                 dead_nodes.append(address)
                                 self._reverse_ping_failures.pop(address, None)
