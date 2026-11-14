@@ -913,6 +913,9 @@ class SupervisorActor(ModelReloadMixin, SupervisorHandoffMixin, xo.StatelessActo
         """Shared cleanup for a worker that has gone away — heartbeat-dead,
         reverse-channel-dead, or graceful remove_worker.
 
+        Liveness timeouts do not prove resource absence. Retained failed-launch
+        cleanup targets are resolved separately.
+
         1. Record each downed replica into _unexpected_down_replicas (per-replica;
            degraded models keep their healthy replicas).
         2. Remove only this worker's replicas via
@@ -921,7 +924,6 @@ class SupervisorActor(ModelReloadMixin, SupervisorHandoffMixin, xo.StatelessActo
            *all* its replicas are gone.
         3. Reconcile replica statuses/counts, and advance fully-gone models to
            TERMINATED so model_status disappears; degraded models stay READY.
-        4. Resolve failed-initial-launch targets for this retired registration.
         """
         affected_replica_uids = await self._record_unexpected_down_replicas(
             worker_address
@@ -942,13 +944,6 @@ class SupervisorActor(ModelReloadMixin, SupervisorHandoffMixin, xo.StatelessActo
             ):
                 await self._cleanup_distributed_actors(base_uid)
         await self._reconcile_affected_model_statuses(base_uids_affected)
-        # Only the confirmed removal paths call this helper. A rejected
-        # re-registration can also clear the registry, but is not proof of death.
-        worker_ref = self._worker_address_to_worker.get(worker_address)
-        for operation in getattr(self, "_initial_model_launches", {}).values():
-            if operation.cleanup_pending and not operation.cancelling:
-                for workers in operation.workers.values():
-                    workers[:] = [worker for worker in workers if worker != worker_ref]
         return affected_replica_uids
 
     def _clear_unexpected_down_replicas(self, model_uid: str) -> None:
@@ -7779,6 +7774,14 @@ class SupervisorActor(ModelReloadMixin, SupervisorHandoffMixin, xo.StatelessActo
         # for fully-gone models (graceful worker shutdown is the third path
         # where models won't auto-recover and need redeploy).
         await self._handle_dead_worker(worker_address)
+
+        # Graceful shutdown acknowledges retirement. Health-check timeouts also
+        # remove routing, but cannot prove that these resources are gone.
+        worker_ref = self._worker_address_to_worker.get(worker_address)
+        for operation in getattr(self, "_initial_model_launches", {}).values():
+            if operation.cleanup_pending and not operation.cancelling:
+                for workers in operation.workers.values():
+                    workers[:] = [worker for worker in workers if worker != worker_ref]
 
         if worker_address in self._worker_address_to_worker:
             del self._worker_address_to_worker[worker_address]

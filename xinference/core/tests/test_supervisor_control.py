@@ -16,7 +16,7 @@ from ..control_session import CONTROL_CONTEXT_KEY, ControlSessionRejected
 from ..model import ModelActor
 from ..replica_config import DeviceConfig, ReplicaConfig
 from ..status_guard import StatusGuardActor
-from ..supervisor import ReplicaInfo, SupervisorActor
+from ..supervisor import ReplicaInfo, SupervisorActor, WorkerStatus
 from ..supervisor_control import SupervisorControl, SupervisorControlPort
 from ..supervisor_upgrade import SupervisorGateway
 from ..utils import CancelMixin, build_replica_model_uid
@@ -537,6 +537,89 @@ async def test_failed_initial_launch_retired_worker(failed_launch_runtime):
     assert await rt.owner.launch_builtin_model(**rt.kwargs) == "failed"
     assert rt.workers[0].models == {"failed-rep0"}
     assert not retired.models
+    await rt.owner.terminate_model("failed")
+    assert all(not w.models for w in rt.workers)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timeout", ["heartbeat", "reverse_ping"])
+@pytest.mark.parametrize("resolution", ["termination", "inventory"])
+async def test_failed_initial_launch_live_worker_health_timeout(
+    failed_launch_runtime, monkeypatch, timeout, resolution
+):
+    from .. import supervisor as supervisor_module
+
+    rt = failed_launch_runtime
+    operation = await _failed_launch(rt)
+    rt.state.failed, rt.loss = False, "healthy"
+    healthy, worker = rt.workers
+    rt.owner._actor_loop = asyncio.get_running_loop()
+    worker.cleanup_error = asyncio.TimeoutError("reverse link unavailable")
+    for current in rt.workers:
+        monkeypatch.setattr(current, "ping", AsyncMock(), raising=False)
+        rt.owner._worker_status[current.address] = WorkerStatus(
+            update_time=supervisor_module.time.time(),
+            failure_remaining_count=2,
+            status={},
+        )
+    worker.ping.side_effect = asyncio.TimeoutError("reverse link unavailable")
+    if timeout == "heartbeat":
+        rt.owner._worker_status[worker.address].update_time = 0
+    with monkeypatch.context() as health:
+        health.setattr(
+            supervisor_module, "XINFERENCE_HEALTH_CHECK_FAILURE_THRESHOLD", 2
+        )
+        health.setattr(
+            supervisor_module.asyncio,
+            "sleep",
+            AsyncMock(side_effect=[None, asyncio.CancelledError()]),
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await rt.owner._check_dead_nodes()
+    assert worker.ping.await_count == (2 if timeout == "reverse_ping" else 1)
+    assert worker.address not in rt.owner._worker_address_to_worker
+    assert healthy.address in rt.owner._worker_address_to_worker
+    assert worker.models == {"failed-rep1"}
+    assert operation.workers["failed-rep1"]
+
+    with pytest.raises(asyncio.TimeoutError) as exc:
+        await rt.owner.terminate_model("failed")
+    assert exc.value is worker.cleanup_error
+    assert rt.owner._initial_model_launches["failed"] is operation
+    assert operation.workers["failed-rep1"] and worker.models
+    assert not healthy.models and not operation.workers["failed-rep0"]
+    rt.kwargs.update(replica=1, worker_ip=healthy.address)
+    rt.replacing = True
+    with pytest.raises(asyncio.TimeoutError) as exc:
+        await rt.owner.launch_builtin_model(**rt.kwargs)
+    assert exc.value is worker.cleanup_error
+    assert rt.owner._initial_model_launches["failed"] is operation
+    assert operation.workers["failed-rep1"] and worker.models
+    assert not healthy.models
+
+    if resolution == "inventory":
+        await rt.owner.add_worker(worker.address)
+        # Re-registration alone does not establish absence of the old replica.
+        with pytest.raises(asyncio.TimeoutError):
+            await rt.owner.terminate_model("failed")
+        assert operation.workers["failed-rep1"] and worker.models
+        inventory = AsyncMock(wraps=worker.list_models)
+        launch_status = AsyncMock(wraps=worker.get_model_launch_status)
+        monkeypatch.setattr(worker, "list_models", inventory)
+        monkeypatch.setattr(worker, "get_model_launch_status", launch_status)
+        worker.models.clear()
+    else:
+        worker.cleanup_error = None
+    await rt.owner.terminate_model("failed")
+    if resolution == "inventory":
+        inventory.assert_awaited_once()
+        launch_status.assert_awaited_once_with("failed-rep1")
+    assert not operation.workers["failed-rep1"]
+    assert not rt.owner._initial_model_launches
+    assert not rt.guard.get_instance_info(model_uid="failed")
+    assert all(not w.models for w in rt.workers)
+    assert await rt.owner.launch_builtin_model(**rt.kwargs) == "failed"
+    assert healthy.models == {"failed-rep0"} and not worker.models
     await rt.owner.terminate_model("failed")
     assert all(not w.models for w in rt.workers)
 
